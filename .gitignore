@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Data & Logs
+*.log
+*.pkl
+*.csv
+*.json
+*.db
+/tmp/
+/private/
+
+# Environment
+.env
+.env.local
+*.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# API keys (never commit these)
+# config.py uses env vars, so it's safe to commit the template
