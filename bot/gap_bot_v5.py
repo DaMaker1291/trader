@@ -41,6 +41,9 @@ import urllib.request
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 logger = logging.getLogger("GapBotV5")
+# Suppress yfinance noise (404s, rate-limit warnings)
+yf_logger = logging.getLogger("yfinance")
+yf_logger.setLevel(logging.CRITICAL)
 
 # ── Timezones ──────────────────────────────────────────────────────────
 NY_TZ = ZoneInfo("America/New_York")
@@ -121,6 +124,7 @@ MODEL_DB = "/tmp/gap_model_v5.json"
 
 # ── Liquidity cache ────────────────────────────────────────────────────
 _LIQ_CACHE: Dict[str, Optional[Dict]] = {}
+_BAD_SYMBOLS: set = set()  # symbols that return 404 — skip on re-scan
 
 WATCHLIST = [
     "NVDA","AMD","TSLA","META","AMZN","GOOGL","MSFT","AAPL","NFLX",
@@ -695,6 +699,8 @@ class GapBotV5:
         )
 
         for sym in WATCHLIST:
+            if sym in _BAD_SYMBOLS:
+                continue
             try:
                 tk = yf.Ticker(sym)
                 hist = tk.history(period="5d", interval="5m", prepost=True)
@@ -786,6 +792,7 @@ class GapBotV5:
                 })
                 await asyncio.sleep(0.05)
             except Exception as e:
+                _BAD_SYMBOLS.add(sym)
                 logger.debug("Scan skip %s: %s", sym, e)
 
         results.sort(key=lambda x: x["score"], reverse=True)
@@ -803,6 +810,8 @@ class GapBotV5:
         today_d = date.today()
 
         for sym in WATCHLIST:
+            if sym in _BAD_SYMBOLS:
+                continue
             try:
                 tk = yf.Ticker(sym)
                 hist = tk.history(period="2d", interval="5m", prepost=True)
@@ -846,6 +855,7 @@ class GapBotV5:
                 })
                 await asyncio.sleep(0.05)
             except Exception as e:
+                _BAD_SYMBOLS.add(sym)
                 logger.debug("PH scan skip %s: %s", sym, e)
 
         results.sort(key=lambda x: abs(x["move"]), reverse=True)
@@ -861,6 +871,8 @@ class GapBotV5:
         today_d = date.today()
 
         for sym in WATCHLIST:
+            if sym in _BAD_SYMBOLS:
+                continue
             try:
                 tk = yf.Ticker(sym)
                 hist = tk.history(period="2d", interval="5m", prepost=True)
@@ -914,6 +926,7 @@ class GapBotV5:
                 })
                 await asyncio.sleep(0.05)
             except Exception as e:
+                _BAD_SYMBOLS.add(sym)
                 logger.debug("Midday scan skip %s: %s", sym, e)
 
         results.sort(key=lambda x: abs(x["move"]) * x["rel_vol"], reverse=True)
