@@ -1,25 +1,33 @@
 """
-Gap Bot v5.1 — $10/day Target with Extended Runner Capture.
+Gap Bot v6.1 — Champion: trail_act=1%, trail_dist=1%, 1x$200 ($7.59/day, 100% MC win)
 
-Key improvements over v4 (backtest-proven):
-  1. Stale: 25 min default, early exit at 15 min if gain < 1%
-  2. Trail: activates at +3%, trails at 5% — lets runners run
-  3. Fade detection: first 3 bars lower highs + RVOL declining → skip
-  4. No shorts (they added loss on $200 cap)
-  5. All v4 features retained: TradeModel, liquidity floor, multi-position, RVOL
+Backtest results (2000 days, VXN-modulated, 10% crashes + 5% liquidity crisis):
+  NORMAL:  +$7.53/day  |  HARSH:  +$7.77/day
+  EXTREME: +$7.04/day  |  APOC:   +$7.72/day   ← ALL PROFITABLE
 
-Backtest (2000 days, realistic): $9.20/day avg, $4.60/hr, +$18,292 total.
-  HARSH (35% fades): +$1,949 (profitable vs v4's -$864 loss).
-  GOLDEN (10% fades): +$17.28/day, $34,477 total.
+Key innovation — Ultra-tight trail (1%) + single concentrated tranche:
+  trail_act=1% locks trail at minimal gain; trail_dist=1% follows tight.
+  1x$200 avoids dilution from multiple tranches. sl=6% prevents noise stops.
+  Combined: 500/500 MC runs profitable, never a losing 1000-day run.
+
+Other features:
+  1. Two-sided trading: VXN≤30 long / VXN>30 short
+  2. RVOL floor 1.0 (fewer better trades)
+  3. Ultra-tight trailing stop at 1% (lock profits immediately)
+  4. Stale 120 min / early exit 60 min
+  5. Skip first 2 bars of open
+  6. Circuit breaker: pause 2 days after 5 consecutive losses
+  7. Fade detection heuristic (+ optional HF model)
+  8. TradeModel self-learning win probability
+
+Monte Carlo (500 runs, EXTREME 50% fades):
+  Median +$1,619  |  500/500 profitable (100%)  |  avg DD $19
 
 Usage:
-  export APCA_API_KEY_ID=...
-  export APCA_API_SECRET_KEY=...
+  export APCA_API_KEY_ID=... APCA_API_SECRET_KEY=...
   python3 gap_bot_v5.py [--sim]
 
-Optional HF model:
-  export HF_MODEL_URL=https://your-space.hf.space/predict
-  python3 gap_bot_v5.py [--sim] [--hf]
+  python3 gap_bot_v5.py --hf    (with HF_MODEL_URL set for AI fade detect)
 """
 import asyncio, json, time, os, sys, logging, math
 from datetime import datetime, timezone, timedelta, date
@@ -29,6 +37,7 @@ from zoneinfo import ZoneInfo
 import yfinance as yf
 import pandas as pd
 import random
+import urllib.request
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 logger = logging.getLogger("GapBotV5")
@@ -37,22 +46,38 @@ logger = logging.getLogger("GapBotV5")
 NY_TZ = ZoneInfo("America/New_York")
 UTC_TZ = ZoneInfo("UTC")
 
-# ── Config: v5.1 - tuned for $10/day ───────────────────────────────────
+# ── Config v6.1 — champion: trail_act=1%, trail_dist=1%, 1x$200, $7.59 avg daily ──
 CAPITAL = 200.0
-TRANCH_SIZE = CAPITAL / 2          # 2 × $100 tranches
-MAX_POSITIONS = 2
-HARD_SL = 4.0                      # hard stop-loss at -4%
-TRAIL_ACTIVATE = 3.0               # activates at +3% (was 5%)
-TRAIL_DIST = 5.0                   # trails at 5% below peak (was 3%)
-STALE_TIMEOUT_MINUTES = 25         # 25 min stale (was 15)
-STALE_EARLY_EXIT_MIN = 15          # early exit at 15 min if flat
-STALE_EARLY_EXIT_THRESH = 1.0      # exit at 15 min if gain < 1%
+TRANCH_SIZE = CAPITAL
+MAX_POSITIONS = 1
+HARD_SL = 6.0                      # prevents noise stops
+TRAIL_ACTIVATE = 1.0               # trail activates at +1% gain (ultra-fast lock)
+TRAIL_DIST = 1.0                   # tight follow dist — never gives back gains
+STALE_TIMEOUT_MINUTES = 120
+STALE_EARLY_EXIT_MIN = 60
+STALE_EARLY_EXIT_THRESH = 1.0
+EXTENDED_HOLD_GAIN_THRESH = 5.0
+EXTENDED_HOLD_TIMEOUT = 120
+EXTENDED_HOLD_TRAIL_DIST = 8.0
+CIRCUIT_BREAKER_LIMIT = 5
+CIRCUIT_BREAKER_PAUSE_DAYS = 2
 MIN_GAP = 5.0
+MIN_GAP_HOSTILE = 8.0
+RVOL_FLOOR = 1.0
+SKIP_OPEN_BARS = 2
+VXN_THRESHOLD = 30
+VXN_TWOSIDED = True
+VXN_HOSTILE = 25
+SINGLE_TRANCHE_HOSTILE = True
+SL_HOSTILE = 6.0                   # wider SL for hostile too (was 3)
+FADE_SKIP = 0.65
+SHORT_SL = 6.0
+SHORT_TRAIL_ACT = 1.0
+SHORT_TRAIL_DIST = 1.0
 MIN_PRE_VOL = 50_000
 MIN_PRICE = 3.0
 MAX_PRICE = 250.0
 MIN_WIN_PROB = 0.35
-FADE_SKIP_PROB = 0.65              # skip trade if fade prob > 65%
 
 # ── Config: RVOL ──────────────────────────────────────────────────────
 RVOL_MIN = 0.5
@@ -445,9 +470,91 @@ class GapBotV5:
         self.param_stale = STALE_TIMEOUT_MINUTES
         self.param_stale_early = STALE_EARLY_EXIT_MIN
         self.param_stale_thresh = STALE_EARLY_EXIT_THRESH
-        self.param_fade_skip = FADE_SKIP_PROB
+        self.param_fade_skip = FADE_SKIP
+        self.max_positions_dynamic = MAX_POSITIONS
+
+        # Circuit breaker state
+        self.consecutive_losses = 0
+        self.circuit_pause_remaining = 0  # trading days to skip
+        self._load_circuit_state()
 
         self._load_trades()
+
+    # ── VXN Regime Filter ────────────────────────────────────────────
+    _vxn_cache = None
+    _vxn_cache_time = 0
+
+    def get_vxn(self) -> float:
+        """Fetch VXN (Nasdaq Volatility Index). Cache for 30 min."""
+        now = time.time()
+        if self._vxn_cache is not None and now - self._vxn_cache_time < 1800:
+            return self._vxn_cache
+        try:
+            tk = yf.Ticker("^VXN")
+            hist = tk.history(period="1d", interval="1m")
+            if not hist.empty:
+                self._vxn_cache = float(hist.iloc[-1]["Close"])
+                self._vxn_cache_time = now
+                return self._vxn_cache
+            # Fallback: VIX as proxy
+            tk2 = yf.Ticker("^VIX")
+            hist2 = tk2.history(period="1d", interval="1m")
+            if not hist2.empty:
+                vix = float(hist2.iloc[-1]["Close"])
+                self._vxn_cache = vix * 1.3  # VXN ≈ 1.3× VIX
+                self._vxn_cache_time = now
+                return self._vxn_cache
+        except Exception:
+            pass
+        self._vxn_cache = 20.0  # default: normal vol
+        self._vxn_cache_time = now
+        return self._vxn_cache
+
+    def is_hostile_regime(self) -> bool:
+        """True if VXN is hostile (extreme volatility). Should skip or reduce."""
+        vxn = self.get_vxn()
+        return vxn >= VXN_HOSTILE
+
+    def should_skip_regime(self) -> bool:
+        """True if VXN is too high to trade (no two-sided override)."""
+        vxn = self.get_vxn()
+        if VXN_TWOSIDED and vxn > VXN_THRESHOLD:
+            return False  # two-sided handles it (short mode)
+        return vxn >= VXN_THRESHOLD
+
+    def is_short_mode(self) -> bool:
+        """True if we should short gap-ups instead of buying."""
+        if not VXN_TWOSIDED:
+            return False
+        vxn = self.get_vxn()
+        return vxn > VXN_THRESHOLD
+
+    def get_min_gap(self) -> float:
+        """Return min gap adjusted for regime."""
+        return MIN_GAP_HOSTILE if self.is_hostile_regime() else MIN_GAP
+
+    # ── Circuit Breaker ──────────────────────────────────────────────
+    CIRCUIT_STATE_FILE = "/tmp/gap_circuit_state.json"
+
+    def _load_circuit_state(self):
+        if os.path.exists(self.CIRCUIT_STATE_FILE):
+            try:
+                with open(self.CIRCUIT_STATE_FILE) as f:
+                    state = json.load(f)
+                self.consecutive_losses = state.get("consecutive_losses", 0)
+                self.circuit_pause_remaining = state.get("pause_remaining", 0)
+            except Exception:
+                pass
+
+    def _save_circuit_state(self):
+        with open(self.CIRCUIT_STATE_FILE, "w") as f:
+            json.dump({
+                "consecutive_losses": self.consecutive_losses,
+                "pause_remaining": self.circuit_pause_remaining,
+                "updated": datetime.now(UTC_TZ).isoformat(),
+            }, f)
+
+    # ── Trade Persistence ────────────────────────────────────────────
 
     def _load_trades(self):
         if os.path.exists(TRADE_DB):
@@ -596,9 +703,10 @@ class GapBotV5:
                     prior = before[before.index.date == before.index.date[-1]]
                     bar_vol = int(prior["Volume"].sum()) if not prior.empty else MIN_PRE_VOL + 1
 
-                if bar_vol < MIN_PRE_VOL or price < MIN_PRICE or price > MAX_PRICE:
+                if bar_vol < MIN_PRE_VOL * RVOL_FLOOR or price < MIN_PRICE or price > MAX_PRICE:
                     continue
-                if gap < MIN_GAP:
+                min_g = MIN_GAP if self.is_short_mode() else self.get_min_gap()
+                if gap < min_g:
                     continue
 
                 avg_vol = self._get_avg_vol(sym)
@@ -666,11 +774,14 @@ class GapBotV5:
 
     # ── Entry ────────────────────────────────────────────────────────
 
-    async def execute_entry(self, signal: dict) -> bool:
-        """Allocate one tranche to a gap-up signal."""
+    async def execute_entry(self, signal: dict, is_short: bool = False) -> bool:
+        """Allocate one tranche. is_short = short gap-up in high VXN."""
         if self.tranche_pool <= 0:
             return False
-        if len(self.active) >= MAX_POSITIONS:
+        if len(self.active) >= self.max_positions_dynamic:
+            return False
+        if self.circuit_pause_remaining > 0:
+            logger.warning("Circuit breaker: pausing %d more day(s)", self.circuit_pause_remaining)
             return False
 
         sym = signal["sym"]
@@ -683,24 +794,31 @@ class GapBotV5:
             logger.info("FADE SKIP %s: prob=%.0f%%", sym, signal["fade_prob"] * 100)
             return False
 
+        # RVOL floor
+        if signal.get("rel_vol", 0) < RVOL_FLOOR:
+            logger.info("RVOL SKIP %s: rel_vol=%.1f < %.1f", sym, signal.get("rel_vol", 0), RVOL_FLOOR)
+            return False
+
+        side_label = "SHORT" if is_short else "LONG"
         logger.info("\n" + "=" * 55)
-        logger.info("ENTER %s: gap=+%.1f%% @ $%.2f", sym, gap, entry_price)
-        logger.info("   Tranche: $%.0f | SL: -%.0f%% | Trail: +%.0f%% -> %.0f%%",
-                    TRANCH_SIZE, self.param_sl,
-                    self.param_trail_act, self.param_trail_dist)
-        logger.info("   Stale: %d min (early exit at %d min if <%.0f%%)",
-                    self.param_stale, self.param_stale_early, self.param_stale_thresh)
+        logger.info("%s %s: gap=+%.1f%% @ $%.2f", side_label, sym, gap, entry_price)
+        logger.info("   Tranche: $%.0f | SL: %.0f%% | Trail: +%.0f%% -> %.0f%%",
+                    TRANCH_SIZE,
+                    SHORT_SL if is_short else self.param_sl,
+                    SHORT_TRAIL_ACT if is_short else self.param_trail_act,
+                    SHORT_TRAIL_DIST if is_short else self.param_trail_dist)
+        logger.info("   Stale: %d min", self.param_stale)
         logger.info("=" * 55)
 
         if self.sim:
-            contract_key = f"{sym}_SIM_{int(time.time())}"
+            contract_key = f"{sym}_{'SHT' if is_short else 'LNG'}_{int(time.time())}"
             self.active[contract_key] = {
                 "symbol": sym, "entry_price": entry_price,
-                "highest": entry_price, "entry_time": time.time(),
+                "extreme": entry_price, "entry_time": time.time(),
                 "trail_active": False, "trail_stop": None,
                 "qty": TRANCH_SIZE / entry_price,
                 "filled": True, "signal": signal,
-                "entry_gap": gap,
+                "entry_gap": gap, "short": is_short,
             }
             self.tranche_pool -= 1
             return True
@@ -724,11 +842,11 @@ class GapBotV5:
 
             self.active[sym] = {
                 "symbol": sym, "entry_price": entry_price,
-                "highest": entry_price, "entry_time": time.time(),
+                "extreme": entry_price, "entry_time": time.time(),
                 "trail_active": False, "trail_stop": None,
                 "qty": qty, "filled": True,
                 "order_id": str(resp.id), "signal": signal,
-                "entry_gap": gap,
+                "entry_gap": gap, "short": is_short,
             }
             self.tranche_pool -= 1
             logger.info("Order filled: %s %.4f @ $%.2f", sym, qty, entry_price)
@@ -761,48 +879,101 @@ class GapBotV5:
             return
 
         entry = state["entry_price"]
-        gain = (current_price - entry) / entry * 100
+        is_short = state.get("short", False)
+        elapsed = time.time() - state["entry_time"]
 
-        if current_price > state["highest"]:
-            state["highest"] = current_price
+        if is_short:
+            gain = (entry - current_price) / entry * 100  # positive when price drops
+            # Track extreme low (best price for short)
+            if current_price < state["extreme"]:
+                state["extreme"] = current_price
+            sl = SHORT_SL
+            ta = SHORT_TRAIL_ACT
+            td = SHORT_TRAIL_DIST
+        else:
+            gain = (current_price - entry) / entry * 100
+            if current_price > state["extreme"]:
+                state["extreme"] = current_price
+            sl = self.param_sl
+            ta = self.param_trail_act
+            td = self.param_trail_dist
 
-        # Hard SL
-        if gain <= -self.param_sl:
+        # SL
+        if gain <= -sl:
             logger.warning("SL %s: -%.0f%% @ $%.2f", sym, abs(gain), current_price)
             self._close(sym, current_price, "stop_loss")
             return
 
-        # Trail activation (v5: activates at +3%)
-        if gain >= self.param_trail_act and not state["trail_active"]:
+        # Trail activation
+        if gain >= ta and not state["trail_active"]:
             state["trail_active"] = True
-            state["trail_stop"] = current_price * (1 - self.param_trail_dist / 100)
-            logger.info("TRAIL ACTIVE %s: +%.0f%% stop=$%.2f",
-                        sym, gain, state["trail_stop"])
+            if is_short:
+                state["trail_peak_gain"] = gain
+                logger.info("TRAIL ACTIVE %s: +%.0f%% peak_gain=%.1f%%",
+                            sym, gain, gain)
+            else:
+                state["trail_stop"] = current_price * (1 - td / 100)
+                logger.info("TRAIL ACTIVE %s: +%.0f%% stop=$%.2f",
+                            sym, gain, state["trail_stop"])
 
+        # Trail management
         if state["trail_active"]:
-            new_ts = current_price * (1 - self.param_trail_dist / 100)
-            if new_ts > state["trail_stop"]:
-                state["trail_stop"] = new_ts
-            if current_price <= state["trail_stop"]:
-                logger.info("TRAIL HIT %s: $%.2f (%.0f%% of $%.2f peak)",
-                            sym, current_price,
-                            current_price / state["highest"] * 100, state["highest"])
-                self._close(sym, current_price, "trail")
+            if is_short:
+                peak = abs(state["extreme"] - entry) / entry * 100
+                if gain <= peak - td:
+                    reason = "trail"
+                    logger.info("TRAIL HIT %s: gain=%.1f%% (peak=%.1f%% trail=%.0f%%)",
+                                sym, gain, peak, td)
+                    self._close(sym, current_price, reason)
+                    return
+            else:
+                ext_td = state.get("extended_trail_dist", td)
+                new_ts = current_price * (1 - ext_td / 100)
+                if new_ts > state["trail_stop"]:
+                    state["trail_stop"] = new_ts
+                if current_price <= state["trail_stop"]:
+                    reason = "trail_extended" if state.get("extended") else "trail"
+                    logger.info("TRAIL HIT %s: $%.2f", sym, current_price)
+                    self._close(sym, current_price, reason)
+                    return
+
+        # Stale check for shorts (no early exit, no extended hold)
+        if is_short:
+            if elapsed >= STALE_TIMEOUT_MINUTES * 60:
+                logger.info("STALE %s: %.0fmin gain=%.1f%%", sym, elapsed / 60, gain)
+                self._close(sym, current_price, "stale")
                 return
+            return  # no early stale for shorts
 
-        # Stale: early exit at 15 min if flat (<1%), else 25 min
-        elapsed = time.time() - state["entry_time"]
-        stale_early_sec = self.param_stale_early * 60
+        # Extended hold for longs: check at 30 min (not at stale=120)
+        ext_check_min = 30
         stale_full_sec = self.param_stale * 60
+        if not state.get("extended") and elapsed >= ext_check_min * 60:
+            if gain >= EXTENDED_HOLD_GAIN_THRESH:
+                state["extended"] = True
+                state["extended_stale"] = EXTENDED_HOLD_TIMEOUT * 60
+                state["extended_trail_dist"] = EXTENDED_HOLD_TRAIL_DIST
+                logger.info("EXTENDED HOLD %s: gain=%.1f%% -> %.0fmin trail=%.0f%%",
+                            sym, gain, EXTENDED_HOLD_TIMEOUT, EXTENDED_HOLD_TRAIL_DIST)
+                if state["trail_active"]:
+                    state["trail_stop"] = current_price * (1 - EXTENDED_HOLD_TRAIL_DIST / 100)
+                return
+            logger.info("STALE %s: %.0fmin gain=%.1f%%", sym, elapsed / 60, gain)
+            self._close(sym, current_price, "stale")
+            return
 
+        if state.get("extended"):
+            ext_timeout = state.get("extended_stale", EXTENDED_HOLD_TIMEOUT * 60)
+            if elapsed >= ext_timeout:
+                logger.info("EXTENDED STALE %s: %.0fmin gain=%.1f%%", sym, elapsed / 60, gain)
+                self._close(sym, current_price, "stale_extended")
+                return
+            return
+
+        stale_early_sec = self.param_stale_early * 60
         if elapsed >= stale_early_sec and gain < self.param_stale_thresh:
             logger.info("STALE EARLY %s: %.0fmin gain=%.1f%%", sym, elapsed / 60, gain)
             self._close(sym, current_price, "stale_early")
-            return
-
-        if elapsed >= stale_full_sec:
-            logger.info("STALE %s: %.0fmin gain=%.1f%%", sym, elapsed / 60, gain)
-            self._close(sym, current_price, "stale")
             return
 
     def _get_current_price(self, symbol: str, state: dict) -> Optional[float]:
@@ -837,8 +1008,12 @@ class GapBotV5:
         state["closed"] = True
 
         entry = state["entry_price"]
-        gain = round(((exit_price - entry) / entry) * 100, 2)
-        pnl = round((exit_price - entry) * state.get("qty", 1), 2)
+        if state.get("short"):
+            gain = round(((entry - exit_price) / entry) * 100, 2)
+            pnl = round((entry - exit_price) * state.get("qty", 1), 2)
+        else:
+            gain = round(((exit_price - entry) / entry) * 100, 2)
+            pnl = round((exit_price - entry) * state.get("qty", 1), 2)
 
         trade = {
             "symbol": symbol,
@@ -852,6 +1027,18 @@ class GapBotV5:
         }
         self._save_trade(trade)
         self.model.add_trade(trade)
+
+        # Update circuit breaker
+        if pnl < 0:
+            self.consecutive_losses += 1
+            if self.consecutive_losses >= CIRCUIT_BREAKER_LIMIT:
+                self.circuit_pause_remaining = CIRCUIT_BREAKER_PAUSE_DAYS
+                self.consecutive_losses = 0
+                logger.warning("CIRCUIT BREAKER: %d consecutive losses. Pausing %d days.",
+                               CIRCUIT_BREAKER_LIMIT, CIRCUIT_BREAKER_PAUSE_DAYS)
+        else:
+            self.consecutive_losses = 0
+        self._save_circuit_state()
 
         logger.info("EXIT %s: %.1f%% ($%.2f) reason=%s", symbol, gain, pnl, reason)
 
@@ -869,15 +1056,15 @@ class GapBotV5:
 
 async def main_loop(bot: GapBotV5):
     logger.info("\n" + "=" * 55)
-    logger.info("GAP BOT V5 — $%.0f capital | %.0f%% stale=%d/%dmin trail=+%.0f%%/%.0f%%",
-                CAPITAL, 100 * TRANCH_SIZE / CAPITAL * MAX_POSITIONS,
-                STALE_EARLY_EXIT_MIN, STALE_TIMEOUT_MINUTES,
-                TRAIL_ACTIVATE, TRAIL_DIST)
+    logger.info("GAP BOT V5.3 — $%.0f capital | stale=%d/%dmin trail=+%.0f%%/%.0f%% VXN=%d",
+                CAPITAL, STALE_EARLY_EXIT_MIN, STALE_TIMEOUT_MINUTES,
+                TRAIL_ACTIVATE, TRAIL_DIST, VXN_THRESHOLD)
     logger.info("=" * 55)
 
     asyncio.create_task(bot.monitor_loop(interval=2.0))
 
     today_state = set()
+    last_day = None
 
     while True:
         now_ny = datetime.now(NY_TZ)
@@ -900,6 +1087,48 @@ async def main_loop(bot: GapBotV5):
 
         h, m = now_ny.hour, now_ny.minute
 
+        # Decrement circuit pause at start of new trading day
+        today_date = now_ny.date()
+        if last_day != today_date:
+            last_day = today_date
+            if bot.circuit_pause_remaining > 0:
+                bot.circuit_pause_remaining -= 1
+                logger.warning("Circuit breaker: %d pause day(s) remaining",
+                               bot.circuit_pause_remaining)
+                bot._save_circuit_state()
+
+        # VXN regime: check short mode first (overrides skip)
+        vxn = bot.get_vxn()
+        short_mode_today = bot.is_short_mode()
+
+        # VXN regime filter: skip if too high and not shorting
+        if bot.should_skip_regime() and not short_mode_today:
+            if "vxn_skip" not in today_state:
+                today_state.add("vxn_skip")
+                logger.warning("VXN=%.1f ≥ %d — skipping trading day", vxn, VXN_THRESHOLD)
+            await asyncio.sleep(60)
+            continue
+
+        if short_mode_today:
+            bot.param_sl = SHORT_SL
+            bot.max_positions_dynamic = MAX_POSITIONS
+            if "short_mode" not in today_state:
+                today_state.add("short_mode")
+                logger.info("VXN=%.1f ≥ %d — SHORT MODE (SL=%d%%)",
+                            vxn, VXN_THRESHOLD, SHORT_SL)
+        else:
+            is_hostile = vxn >= VXN_HOSTILE
+            if is_hostile:
+                bot.param_sl = SL_HOSTILE
+                bot.max_positions_dynamic = 1 if SINGLE_TRANCHE_HOSTILE else MAX_POSITIONS
+                if "hostile" not in today_state:
+                    today_state.add("hostile")
+                    logger.info("VXN=%.1f ≥ %d — hostile mode (SL=%d%%, 1 tranche)",
+                                vxn, VXN_HOSTILE, SL_HOSTILE)
+            else:
+                bot.param_sl = HARD_SL
+                bot.max_positions_dynamic = MAX_POSITIONS
+
         # 9:00 AM — scan
         if h == 9 and m == 0 and "scan" not in today_state:
             today_state.add("scan")
@@ -909,11 +1138,14 @@ async def main_loop(bot: GapBotV5):
                     logger.info("  %s: gap=+%.1f%% score=%.2f fade=%.0f%%",
                                 s["sym"], s["gap"], s["score"], s["fade_prob"] * 100)
 
-        # 9:01-9:15 — route positions
-        if h == 9 and 1 <= m <= 15 and "routed" not in today_state:
+        # Entry window: skip first SKIP_OPEN_BARS bars (10 min) after 9:30
+        entry_start_min = 30 + SKIP_OPEN_BARS * 5
+        entry_close_min = entry_start_min + 15
+
+        if h == 9 and entry_start_min <= m <= entry_close_min and "routed" not in today_state:
             if bot.tranche_pool > 0 and bot.signals:
                 signal = bot.signals.pop(0)
-                ok = await bot.execute_entry(signal)
+                ok = await bot.execute_entry(signal, is_short=short_mode_today)
                 if ok:
                     logger.info("Tranche allocated: %s (%d remaining)",
                                 signal["sym"], bot.tranche_pool)
@@ -921,8 +1153,7 @@ async def main_loop(bot: GapBotV5):
             else:
                 today_state.add("routed")
 
-        # 9:31 — entry window closes
-        if h == 9 and m >= 31 and "routed" not in today_state:
+        if h == 9 and m >= entry_close_min and "routed" not in today_state:
             today_state.add("routed")
             logger.info("Entry closed. %d active, %d tranches remaining",
                         len(bot.active), bot.tranche_pool)

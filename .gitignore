@@ -5,3 +5,8 @@ __pycache__/
 *.json
 /private/
 /tmp/
+
+# Sensitive — contains API key templates
+run_bot.sh
+deploy_bot.sh
+setup.sh
