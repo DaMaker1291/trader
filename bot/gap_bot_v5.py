@@ -92,6 +92,22 @@ PH_TRAIL_ACT = 0.3               # activate trail immediately
 PH_TRAIL_DIST = 0.3              # ultra-tight trail
 PH_MAX_POSITIONS = 1
 
+# ── Midday Momentum Scanner (11:30-3:20 PM) ─────────────────────
+MIDDAY_ENABLED = True
+MIDDAY_SCAN_INTERVAL = 15         # scan every N minutes
+MIDDAY_START_HOUR = 11
+MIDDAY_START_MIN = 30
+MIDDAY_END_HOUR = 15
+MIDDAY_END_MIN = 15
+MIDDAY_MIN_RVOL = 1.5
+MIDDAY_MIN_MOVE = 0.8             # % move in last 15 min to trigger
+MIDDAY_SL = 1.0
+MIDDAY_TRAIL_ACT = 0.3
+MIDDAY_TRAIL_DIST = 0.3
+MIDDAY_MAX_HOLD = 30              # minutes
+MIDDAY_MAX_POS = 1
+PH_MAX_POSITIONS = 1
+
 # ── Config: RVOL ──────────────────────────────────────────────────────
 RVOL_MIN = 0.5
 PRE_MARKET_START_HOUR = 4
@@ -474,6 +490,7 @@ class GapBotV5:
         self.active: Dict[str, dict] = {}
         self.signals: List[dict] = []
         self.ph_signals: List[dict] = []
+        self.midday_ticker = 0
         self.tranche_pool = MAX_POSITIONS
         self.trades: List[dict] = []
 
@@ -836,6 +853,73 @@ class GapBotV5:
         self.ph_signals = results
         return results
 
+    async def scan_midday(self) -> List[dict]:
+        """Scan for midday momentum/reversal setups (11:30-3:15)."""
+        results = []
+        logger.info("Midday scan: %d stocks...", len(WATCHLIST))
+        now_ny = datetime.now(NY_TZ)
+        today_d = date.today()
+
+        for sym in WATCHLIST:
+            try:
+                tk = yf.Ticker(sym)
+                hist = tk.history(period="2d", interval="5m", prepost=True)
+                if hist.empty:
+                    continue
+                if hist.index.tz is None:
+                    hist.index = hist.index.tz_localize(NY_TZ)
+                else:
+                    hist.index = hist.index.tz_convert(NY_TZ)
+
+                today_bars = hist[hist.index.date == today_d]
+                if today_bars.empty or len(today_bars) < 6:
+                    continue
+
+                latest = today_bars.iloc[-1]
+                price = float(latest["Close"])
+
+                if price < MIN_PRICE or price > MAX_PRICE:
+                    continue
+
+                # Recent slice (last 15 min = 3 bars)
+                recent = today_bars.iloc[-3:]
+                recent_vol = int(recent["Volume"].sum())
+                avg_vol = self._get_avg_vol(sym)
+                rel_vol = recent_vol / avg_vol if avg_vol > 0 else 0
+
+                if rel_vol < MIDDAY_MIN_RVOL:
+                    continue
+
+                # Price change over last 15 min
+                start_price = float(recent.iloc[0]["Open"])
+                move = ((price - start_price) / start_price) * 100
+
+                if abs(move) < MIDDAY_MIN_MOVE:
+                    continue
+
+                # Calculate VWAP (today's volume-weighted average price)
+                cum_vol = int(today_bars["Volume"].sum())
+                if cum_vol > 0:
+                    vwap = (today_bars["Close"] * today_bars["Volume"]).sum() / cum_vol
+                    vwap_dist = ((price - vwap) / vwap) * 100
+                else:
+                    vwap_dist = 0
+
+                results.append({
+                    "sym": sym, "move": round(move, 2),
+                    "price": round(price, 2),
+                    "rel_vol": round(rel_vol, 1),
+                    "vwap_dist": round(vwap_dist, 2),
+                    "direction": "long" if move > 0 else "short",
+                })
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                logger.debug("Midday scan skip %s: %s", sym, e)
+
+        results.sort(key=lambda x: abs(x["move"]) * x["rel_vol"], reverse=True)
+        logger.info("Midday scan: %d candidates", len(results))
+        return results
+
     def _get_avg_vol(self, sym: str) -> float:
         try:
             tk = yf.Ticker(sym)
@@ -990,6 +1074,69 @@ class GapBotV5:
             logger.error("PH entry failed for %s: %s", sym, e)
             return False
 
+    async def execute_midday_entry(self, signal: dict) -> bool:
+        """Midday momentum entry. Long on breakouts, short on breakdowns."""
+        if self.circuit_pause_remaining > 0:
+            return False
+        if sum(1 for s in self.active.values() if s.get("midday")) >= MIDDAY_MAX_POS:
+            return False
+
+        sym = signal["sym"]
+        price = signal["price"]
+        is_short = signal["direction"] == "short"
+
+        side_label = "SHORT" if is_short else "LONG"
+        logger.info("\n" + "-" * 45)
+        logger.info("MIDDAY %s %s: move=%.2f%% rvol=%.1f vwap=%.1f%% @ $%.2f",
+                     side_label, sym, signal["move"], signal["rel_vol"],
+                     signal["vwap_dist"], price)
+        logger.info("   SL=%.0f%% Trail=+%.0f%%->%.0f%% | max %.0fmin",
+                     MIDDAY_SL, MIDDAY_TRAIL_ACT, MIDDAY_TRAIL_DIST, MIDDAY_MAX_HOLD)
+        logger.info("-" * 45)
+
+        if self.sim:
+            contract_key = f"MD_{sym}_{'SHT' if is_short else 'LNG'}_{int(time.time())}"
+            self.active[contract_key] = {
+                "symbol": sym, "entry_price": price,
+                "extreme": price, "entry_time": time.time(),
+                "trail_active": False, "trail_stop": None,
+                "qty": TRANCH_SIZE / price,
+                "filled": True, "signal": signal,
+                "short": is_short, "midday": True,
+            }
+            return True
+
+        try:
+            from alpaca.trading.requests import MarketOrderRequest
+            from alpaca.trading.enums import OrderSide, TimeInForce
+
+            qty = round(TRANCH_SIZE / price, 4)
+            if qty < 0.001:
+                return False
+
+            order = MarketOrderRequest(
+                symbol=sym, qty=qty,
+                side=OrderSide.SELL if is_short else OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+            )
+            resp = self.trading_client.submit_order(order)
+            await asyncio.sleep(1)
+
+            self.active[sym] = {
+                "symbol": sym, "entry_price": price,
+                "extreme": price, "entry_time": time.time(),
+                "trail_active": False, "trail_stop": None,
+                "qty": qty, "filled": True,
+                "order_id": str(resp.id), "signal": signal,
+                "short": is_short, "midday": True,
+            }
+            logger.info("Midday order filled: %s %.4f @ $%.2f", sym, qty, price)
+            return True
+
+        except Exception as e:
+            logger.error("Midday entry failed for %s: %s", sym, e)
+            return False
+
     # ── Monitoring ───────────────────────────────────────────────────
 
     async def monitor_loop(self, interval: float = 2.0):
@@ -1023,6 +1170,13 @@ class GapBotV5:
             sl = PH_SL
             ta = PH_TRAIL_ACT
             td = PH_TRAIL_DIST
+        elif state.get("midday"):  # midday momentum — use midday params
+            gain = (current_price - entry) / entry * 100 if not is_short else (entry - current_price) / entry * 100
+            if current_price > state["extreme"]:
+                state["extreme"] = current_price
+            sl = MIDDAY_SL
+            ta = MIDDAY_TRAIL_ACT
+            td = MIDDAY_TRAIL_DIST
         elif is_short:
             gain = (entry - current_price) / entry * 100  # positive when price drops
             # Track extreme low (best price for short)
@@ -1088,8 +1242,8 @@ class GapBotV5:
 
         # Extended hold for longs: check at 30 min (not at stale=120)
         ext_check_min = 30
-        # PH positions: skip stale logic — only SL/trail/EOD close
-        if state.get("ph"):
+        # PH / midday positions: skip stale — only SL/trail/EOD close
+        if state.get("ph") or state.get("midday"):
             return
 
         stale_full_sec = self.param_stale * 60
@@ -1201,9 +1355,15 @@ class GapBotV5:
 
 async def main_loop(bot: GapBotV5):
     logger.info("\n" + "=" * 55)
-    logger.info("GAP BOT V5.3 — $%.0f capital | stale=%d/%dmin trail=+%.0f%%/%.0f%% VXN=%d",
-                CAPITAL, STALE_EARLY_EXIT_MIN, STALE_TIMEOUT_MINUTES,
-                TRAIL_ACTIVATE, TRAIL_DIST, VXN_THRESHOLD)
+    sessions = []
+    sessions.append("gap 9:30-11:30")
+    if MIDDAY_ENABLED:
+        sessions.append("midday 11:30-15:15")
+    if PH_ENABLED:
+        sessions.append("ph 15:30-16:00")
+    logger.info("GAP BOT V5.3 — $%.0f capital | %s", CAPITAL, " + ".join(sessions))
+    logger.info("  sl=%.0f%% trail=+%.0f%%/%.0f%% VXN=%d",
+                HARD_SL, TRAIL_ACTIVATE, TRAIL_DIST, VXN_THRESHOLD)
     logger.info("=" * 55)
 
     asyncio.create_task(bot.monitor_loop(interval=2.0))
@@ -1303,6 +1463,25 @@ async def main_loop(bot: GapBotV5):
             logger.info("Entry closed. %d active, %d tranches remaining",
                         len(bot.active), bot.tranche_pool)
 
+        # ── Midday Momentum Scanner (11:30 - 3:15, every 15 min) ──────
+        if MIDDAY_ENABLED:
+            md_start = (h > MIDDAY_START_HOUR or (h == MIDDAY_START_HOUR and m >= MIDDAY_START_MIN))
+            md_end = (h < MIDDAY_END_HOUR or (h == MIDDAY_END_HOUR and m < MIDDAY_END_MIN))
+            if md_start and md_end:
+                # Check if we should scan this cycle
+                elapsed_cycles = (h * 60 + m) // MIDDAY_SCAN_INTERVAL
+                if elapsed_cycles != bot.midday_ticker:
+                    bot.midday_ticker = elapsed_cycles
+                    midday_signals = await bot.scan_midday()
+                    midday_signals = [s for s in midday_signals
+                                      if s["sym"] not in {st["symbol"] for st in bot.active.values()}]
+                    if midday_signals:
+                        sig = midday_signals[0]
+                        ok = await bot.execute_midday_entry(sig)
+                        if ok:
+                            logger.info("Midday entry: %s %s ($%.2f)",
+                                        sig["sym"], sig["direction"], sig["price"])
+
         # ── Power Hour Scalp ──────────────────────────────────────────
         if PH_ENABLED:
             if h == PH_SCAN_HOUR and m == PH_SCAN_MIN and "ph_scan" not in today_state:
@@ -1354,6 +1533,11 @@ async def main_loop(bot: GapBotV5):
 async def main():
     sim = "--sim" in sys.argv
     use_hf = "--hf" in sys.argv
+    global MIDDAY_ENABLED, PH_ENABLED
+    if "--no-midday" in sys.argv:
+        MIDDAY_ENABLED = False
+    if "--no-ph" in sys.argv:
+        PH_ENABLED = False
 
     key = os.getenv("APCA_API_KEY_ID") or os.getenv("ALPACA_API_KEY")
     secret = os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY")
