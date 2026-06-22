@@ -79,6 +79,19 @@ MIN_PRICE = 3.0
 MAX_PRICE = 250.0
 MIN_WIN_PROB = 0.35
 
+# ── Power Hour Scalp (3:30-4:00 PM) ────────────────────────────────
+PH_ENABLED = True
+PH_SCAN_HOUR = 15
+PH_SCAN_MIN = 20
+PH_ENTRY_HOUR = 15
+PH_ENTRY_MIN_START = 30
+PH_ENTRY_MIN_END = 40
+PH_MIN_MOVE = 2.5                # min % from open to trigger scalp
+PH_SL = 1.0                      # tight stop
+PH_TRAIL_ACT = 0.3               # activate trail immediately
+PH_TRAIL_DIST = 0.3              # ultra-tight trail
+PH_MAX_POSITIONS = 1
+
 # ── Config: RVOL ──────────────────────────────────────────────────────
 RVOL_MIN = 0.5
 PRE_MARKET_START_HOUR = 4
@@ -460,6 +473,7 @@ class GapBotV5:
         # Position tracking
         self.active: Dict[str, dict] = {}
         self.signals: List[dict] = []
+        self.ph_signals: List[dict] = []
         self.tranche_pool = MAX_POSITIONS
         self.trades: List[dict] = []
 
@@ -762,6 +776,66 @@ class GapBotV5:
         self.signals = results
         return results
 
+    async def scan_ph(self) -> List[dict]:
+        """Scan for power hour scalp candidates (3:30 PM).
+        Finds stocks that moved > PH_MIN_MOVE% from their open price.
+        """
+        results = []
+        logger.info("Power hour scan: %d stocks...", len(WATCHLIST))
+        now_ny = datetime.now(NY_TZ)
+        today_d = date.today()
+
+        for sym in WATCHLIST:
+            try:
+                tk = yf.Ticker(sym)
+                hist = tk.history(period="2d", interval="5m", prepost=True)
+                if hist.empty:
+                    continue
+                if hist.index.tz is None:
+                    hist.index = hist.index.tz_localize(NY_TZ)
+                else:
+                    hist.index = hist.index.tz_convert(NY_TZ)
+
+                today_bars = hist[hist.index.date == today_d]
+                if today_bars.empty or len(today_bars) < 3:
+                    continue
+
+                open_bar = today_bars.iloc[0]
+                open_price = float(open_bar["Open"])
+                latest = today_bars.iloc[-1]
+                price = float(latest["Close"])
+
+                # Only trade if market is open (9:30-16:00)
+                if now_ny.hour < 9 or (now_ny.hour == 9 and now_ny.minute < 30):
+                    continue
+
+                move_pct = ((price - open_price) / open_price) * 100
+
+                if abs(move_pct) < PH_MIN_MOVE:
+                    continue
+
+                total_vol = int(today_bars["Volume"].sum())
+                avg_vol = self._get_avg_vol(sym)
+                rel_vol = total_vol / avg_vol if avg_vol > 0 else 0
+
+                if price < MIN_PRICE or price > MAX_PRICE:
+                    continue
+
+                results.append({
+                    "sym": sym, "move": round(move_pct, 1),
+                    "price": round(price, 2), "open": round(open_price, 2),
+                    "vol": total_vol, "rel_vol": round(rel_vol, 1),
+                    "direction": "long" if move_pct < 0 else "short",
+                })
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                logger.debug("PH scan skip %s: %s", sym, e)
+
+        results.sort(key=lambda x: abs(x["move"]), reverse=True)
+        logger.info("PH scan: %d candidates found", len(results))
+        self.ph_signals = results
+        return results
+
     def _get_avg_vol(self, sym: str) -> float:
         try:
             tk = yf.Ticker(sym)
@@ -856,6 +930,66 @@ class GapBotV5:
             logger.error("Entry failed for %s: %s", sym, e)
             return False
 
+    async def execute_ph_entry(self, signal: dict, is_short: bool = False) -> bool:
+        """Power hour entry: mean reversion scalp, 3:30-4:00 PM."""
+        if self.circuit_pause_remaining > 0:
+            logger.warning("Circuit breaker: pausing %d more day(s)", self.circuit_pause_remaining)
+            return False
+
+        sym = signal["sym"]
+        price = signal["price"]
+        direction = signal["direction"]
+
+        side_label = "SHORT" if is_short else "LONG"
+        logger.info("\n" + "-" * 45)
+        logger.info("PH %s %s: move=%.1f%% @ $%.2f", side_label, sym, signal["move"], price)
+        logger.info("   SL=%.0f%% Trail=+%.0f%%->%.0f%% | EOD close",
+                    PH_SL, PH_TRAIL_ACT, PH_TRAIL_DIST)
+        logger.info("-" * 45)
+
+        if self.sim:
+            contract_key = f"PH_{sym}_{'SHT' if is_short else 'LNG'}_{int(time.time())}"
+            self.active[contract_key] = {
+                "symbol": sym, "entry_price": price,
+                "extreme": price, "entry_time": time.time(),
+                "trail_active": False, "trail_stop": None,
+                "qty": TRANCH_SIZE / price,
+                "filled": True, "signal": signal,
+                "short": is_short, "ph": True,
+            }
+            return True
+
+        try:
+            from alpaca.trading.requests import MarketOrderRequest
+            from alpaca.trading.enums import OrderSide, TimeInForce
+
+            qty = round(TRANCH_SIZE / price, 4)
+            if qty < 0.001:
+                return False
+
+            order = MarketOrderRequest(
+                symbol=sym, qty=qty,
+                side=OrderSide.SELL if is_short else OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+            )
+            resp = self.trading_client.submit_order(order)
+            await asyncio.sleep(1)
+
+            self.active[sym] = {
+                "symbol": sym, "entry_price": price,
+                "extreme": price, "entry_time": time.time(),
+                "trail_active": False, "trail_stop": None,
+                "qty": qty, "filled": True,
+                "order_id": str(resp.id), "signal": signal,
+                "short": is_short, "ph": True,
+            }
+            logger.info("PH order filled: %s %.4f @ $%.2f", sym, qty, price)
+            return True
+
+        except Exception as e:
+            logger.error("PH entry failed for %s: %s", sym, e)
+            return False
+
     # ── Monitoring ───────────────────────────────────────────────────
 
     async def monitor_loop(self, interval: float = 2.0):
@@ -882,7 +1016,14 @@ class GapBotV5:
         is_short = state.get("short", False)
         elapsed = time.time() - state["entry_time"]
 
-        if is_short:
+        if state.get("ph"):  # power hour scalp — use PH params
+            gain = (current_price - entry) / entry * 100 if not is_short else (entry - current_price) / entry * 100
+            if current_price > state["extreme"]:
+                state["extreme"] = current_price
+            sl = PH_SL
+            ta = PH_TRAIL_ACT
+            td = PH_TRAIL_DIST
+        elif is_short:
             gain = (entry - current_price) / entry * 100  # positive when price drops
             # Track extreme low (best price for short)
             if current_price < state["extreme"]:
@@ -947,6 +1088,10 @@ class GapBotV5:
 
         # Extended hold for longs: check at 30 min (not at stale=120)
         ext_check_min = 30
+        # PH positions: skip stale logic — only SL/trail/EOD close
+        if state.get("ph"):
+            return
+
         stale_full_sec = self.param_stale * 60
         if not state.get("extended") and elapsed >= ext_check_min * 60:
             if gain >= EXTENDED_HOLD_GAIN_THRESH:
@@ -1157,6 +1302,28 @@ async def main_loop(bot: GapBotV5):
             today_state.add("routed")
             logger.info("Entry closed. %d active, %d tranches remaining",
                         len(bot.active), bot.tranche_pool)
+
+        # ── Power Hour Scalp ──────────────────────────────────────────
+        if PH_ENABLED:
+            if h == PH_SCAN_HOUR and m == PH_SCAN_MIN and "ph_scan" not in today_state:
+                today_state.add("ph_scan")
+                ph_signals = await bot.scan_ph()
+                if ph_signals:
+                    for s in ph_signals[:3]:
+                        logger.info("  PH %s: move=%.1f%% direction=%s",
+                                    s["sym"], s["move"], s["direction"])
+
+            if (h == PH_ENTRY_HOUR and PH_ENTRY_MIN_START <= m <= PH_ENTRY_MIN_END
+                    and "ph_entry" not in today_state and bot.ph_signals):
+                # Grant a PH allocation from pool
+                ph_signal = bot.ph_signals.pop(0)
+                is_short = ph_signal["direction"] == "short"
+                ok = await bot.execute_ph_entry(ph_signal, is_short=is_short)
+                if ok:
+                    logger.info("PH entry: %s %s ($%.2f)",
+                                ph_signal["sym"], ph_signal["direction"], ph_signal["price"])
+                if not bot.ph_signals:
+                    today_state.add("ph_entry")
 
         # 4:00 PM — close
         if h >= 16 and "closed" not in today_state:
