@@ -5,6 +5,7 @@ __pycache__/
 *.json
 /private/
 /tmp/
+.DS_Store
 
 # Sensitive — contains API key templates
 run_bot.sh
