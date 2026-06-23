@@ -1016,13 +1016,15 @@ class GapBotV5:
             from alpaca.trading.requests import MarketOrderRequest
             from alpaca.trading.enums import OrderSide, TimeInForce
 
-            qty = round(TRANCH_SIZE / entry_price, 4)
+            # Leave 2% buffer for slippage
+            qty = round(TRANCH_SIZE * 0.98 / entry_price, 4)
+            qty = max(qty, 0)
             if qty < 0.001:
                 return False
 
             order = MarketOrderRequest(
                 symbol=sym, qty=qty,
-                side=OrderSide.BUY,
+                side=OrderSide.SELL if is_short else OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
             )
             resp = self.trading_client.submit_order(order)
@@ -1077,7 +1079,9 @@ class GapBotV5:
             from alpaca.trading.requests import MarketOrderRequest
             from alpaca.trading.enums import OrderSide, TimeInForce
 
-            qty = round(TRANCH_SIZE / price, 4)
+            # Leave 2% buffer for slippage
+            qty = round(TRANCH_SIZE * 0.98 / price, 4)
+            qty = max(qty, 0)
             if qty < 0.001:
                 return False
 
@@ -1140,7 +1144,9 @@ class GapBotV5:
             from alpaca.trading.requests import MarketOrderRequest
             from alpaca.trading.enums import OrderSide, TimeInForce
 
-            qty = round(TRANCH_SIZE / price, 4)
+            # Leave 2% buffer for slippage
+            qty = round(TRANCH_SIZE * 0.98 / price, 4)
+            qty = max(qty, 0)
             if qty < 0.001:
                 return False
 
