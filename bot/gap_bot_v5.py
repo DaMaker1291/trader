@@ -1429,7 +1429,7 @@ async def main_loop(bot: GapBotV5):
                 logger.info("Nightly tune: %s", best)
             logger.info("Model: %s", bot.model.report())
 
-        # ── Outside market hours: sleep until next 9:00 AM ──
+        # ── Outside market hours: sleep exactly until next open ──
         if h < 9 or h >= 16:
             next_open = now_ny.replace(hour=9, minute=0, second=0, microsecond=0)
             if h >= 16:
@@ -1437,10 +1437,10 @@ async def main_loop(bot: GapBotV5):
             if next_open.weekday() >= 5:
                 next_open += timedelta(days=7 - next_open.weekday())
             sleep_secs = (next_open - now_ny).total_seconds()
-            if sleep_secs >= 60:  # only log if sleeping more than 1 min
+            if sleep_secs >= 10:
                 logger.info("Sleeping %.0f min until %s",
-                            sleep_secs / 60, next_open.strftime("%a %H:%M"))
-            await asyncio.sleep(min(max(sleep_secs, 60), 3600))
+                            sleep_secs / 60, next_open.strftime("%a %H:%M %Z"))
+            await asyncio.sleep(sleep_secs)
             continue
 
         # ── Decrement circuit pause at start of new trading day ──
