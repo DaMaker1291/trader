@@ -98,8 +98,8 @@ PH_MAX_POSITIONS = 1
 # ── Midday Scanner (11:30-3:20 PM) — Momentum + VWAP reversion ──
 MIDDAY_ENABLED = True
 MIDDAY_SCAN_INTERVAL = 15         # scan every N minutes
-MIDDAY_START_HOUR = 11
-MIDDAY_START_MIN = 30
+MIDDAY_START_HOUR = 10
+MIDDAY_START_MIN = 0
 MIDDAY_END_HOUR = 15
 MIDDAY_END_MIN = 15
 MIDDAY_MIN_RVOL = 0.8             # lower — catches quiet markets
@@ -1388,7 +1388,7 @@ async def main_loop(bot: GapBotV5):
     sessions = []
     sessions.append("gap 9:30-11:30")
     if MIDDAY_ENABLED:
-        sessions.append("midday 11:30-15:15")
+        sessions.append("midday 10:00-15:15")
     if PH_ENABLED:
         sessions.append("ph 15:30-16:00")
     logger.info("GAP BOT V5.3 — $%.0f capital | %s", CAPITAL, " + ".join(sessions))
