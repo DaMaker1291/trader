@@ -95,15 +95,16 @@ PH_TRAIL_ACT = 0.3               # activate trail immediately
 PH_TRAIL_DIST = 0.3              # ultra-tight trail
 PH_MAX_POSITIONS = 1
 
-# ── Midday Momentum Scanner (11:30-3:20 PM) ─────────────────────
+# ── Midday Scanner (11:30-3:20 PM) — Momentum + VWAP reversion ──
 MIDDAY_ENABLED = True
 MIDDAY_SCAN_INTERVAL = 15         # scan every N minutes
 MIDDAY_START_HOUR = 11
 MIDDAY_START_MIN = 30
 MIDDAY_END_HOUR = 15
 MIDDAY_END_MIN = 15
-MIDDAY_MIN_RVOL = 1.5
-MIDDAY_MIN_MOVE = 0.8             # % move in last 15 min to trigger
+MIDDAY_MIN_RVOL = 0.8             # lower — catches quiet markets
+MIDDAY_MIN_MOVE = 0.4             # % move in last 15 min to trigger
+MIDDAY_MIN_VWAP_DIST = 0.3        # min distance from VWAP for reversion
 MIDDAY_SL = 1.0
 MIDDAY_TRAIL_ACT = 0.3
 MIDDAY_TRAIL_DIST = 0.3
@@ -864,7 +865,7 @@ class GapBotV5:
         return results
 
     async def scan_midday(self) -> List[dict]:
-        """Scan for midday momentum/reversal setups (11:30-3:15)."""
+        """Scan for midday setups — momentum + VWAP reversion."""
         results = []
         logger.info("Midday scan: %d stocks...", len(WATCHLIST))
         now_ny = datetime.now(NY_TZ)
@@ -897,19 +898,13 @@ class GapBotV5:
                 recent = today_bars.iloc[-3:]
                 recent_vol = int(recent["Volume"].sum())
                 avg_vol = self._get_avg_vol(sym)
-                rel_vol = recent_vol / avg_vol if avg_vol > 0 else 0
-
-                if rel_vol < MIDDAY_MIN_RVOL:
-                    continue
+                rel_vol = recent_vol / avg_vol if avg_vol > 0 else 0.1
 
                 # Price change over last 15 min
                 start_price = float(recent.iloc[0]["Open"])
                 move = ((price - start_price) / start_price) * 100
 
-                if abs(move) < MIDDAY_MIN_MOVE:
-                    continue
-
-                # Calculate VWAP (today's volume-weighted average price)
+                # VWAP
                 cum_vol = int(today_bars["Volume"].sum())
                 if cum_vol > 0:
                     vwap = (today_bars["Close"] * today_bars["Volume"]).sum() / cum_vol
@@ -917,20 +912,42 @@ class GapBotV5:
                 else:
                     vwap_dist = 0
 
+                # Two kinds of setups:
+                direction = None
+                score = 0
+
+                # 1. Momentum — stock moving with volume
+                if rel_vol >= MIDDAY_MIN_RVOL and abs(move) >= MIDDAY_MIN_MOVE:
+                    direction = "long" if move > 0 else "short"
+                    score = abs(move) * rel_vol * 10
+
+                # 2. VWAP reversion — stock far from VWAP (catches quiet drift)
+                if abs(vwap_dist) >= MIDDAY_MIN_VWAP_DIST:
+                    rev_dir = "short" if vwap_dist > 0 else "long"
+                    rev_score = abs(vwap_dist) * 2
+                    if direction is None or rev_score > score:
+                        # Only take reversion if it beats momentum setup
+                        direction = rev_dir
+                        score = rev_score
+
+                if direction is None:
+                    continue
+
                 results.append({
                     "sym": sym, "move": round(move, 2),
-                    "price": round(price, 2),
+                    "price": round(price, 2), "open": float(today_bars.iloc[0]["Open"]),
                     "rel_vol": round(rel_vol, 1),
                     "vwap_dist": round(vwap_dist, 2),
-                    "direction": "long" if move > 0 else "short",
+                    "direction": direction, "score": round(score, 1),
                 })
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.02)
             except Exception as e:
                 _BAD_SYMBOLS.add(sym)
                 logger.debug("Midday scan skip %s: %s", sym, e)
 
-        results.sort(key=lambda x: abs(x["move"]) * x["rel_vol"], reverse=True)
-        logger.info("Midday scan: %d candidates", len(results))
+        results.sort(key=lambda x: x["score"], reverse=True)
+        logger.info("Midday scan: %d candidates (top: %.1f)",
+                     len(results), results[0]["score"] if results else 0)
         return results
 
     def _get_avg_vol(self, sym: str) -> float:
@@ -1390,23 +1407,43 @@ async def main_loop(bot: GapBotV5):
             await asyncio.sleep(3600)
             continue
 
-        if now_ny.hour < 9 or now_ny.hour >= 16:
+        h, m = now_ny.hour, now_ny.minute
+
+        # ── 4:00 PM close — MUST come before outside-hours sleep ──
+        today_date = now_ny.date()
+        if h >= 16 and "closed" not in today_state:
+            today_state.add("closed")
+            logger.info("Market close. Closing %d positions...", len(bot.active))
+            for key, state in list(bot.active.items()):
+                price = bot._get_current_price(state["symbol"], state)
+                if price is None:
+                    price = state.get("highest", state.get("entry_price", 0))
+                bot._close(state["symbol"], price, "eod")
+
+            # Nightly backtest
+            best = bot.model.backtest_params()
+            if best:
+                bot.param_sl = best.get("sl", bot.param_sl)
+                bot.param_trail_act = best.get("trail_act", bot.param_trail_act)
+                bot.param_trail_dist = best.get("trail_dist", bot.param_trail_dist)
+                logger.info("Nightly tune: %s", best)
+            logger.info("Model: %s", bot.model.report())
+
+        # ── Outside market hours: sleep until next 9:00 AM ──
+        if h < 9 or h >= 16:
             next_open = now_ny.replace(hour=9, minute=0, second=0, microsecond=0)
-            if now_ny.hour >= 16:
+            if h >= 16:
                 next_open += timedelta(days=1)
             if next_open.weekday() >= 5:
                 next_open += timedelta(days=7 - next_open.weekday())
             sleep_secs = (next_open - now_ny).total_seconds()
-            if sleep_secs > 0:
+            if sleep_secs >= 60:  # only log if sleeping more than 1 min
                 logger.info("Sleeping %.0f min until %s",
                             sleep_secs / 60, next_open.strftime("%a %H:%M"))
             await asyncio.sleep(min(max(sleep_secs, 60), 3600))
             continue
 
-        h, m = now_ny.hour, now_ny.minute
-
-        # Decrement circuit pause at start of new trading day
-        today_date = now_ny.date()
+        # ── Decrement circuit pause at start of new trading day ──
         if last_day != today_date:
             last_day = today_date
             if bot.circuit_pause_remaining > 0:
@@ -1516,25 +1553,6 @@ async def main_loop(bot: GapBotV5):
                                 ph_signal["sym"], ph_signal["direction"], ph_signal["price"])
                 if not bot.ph_signals:
                     today_state.add("ph_entry")
-
-        # 4:00 PM — close
-        if h >= 16 and "closed" not in today_state:
-            today_state.add("closed")
-            logger.info("Market close. Closing %d positions...", len(bot.active))
-            for key, state in list(bot.active.items()):
-                price = bot._get_current_price(state["symbol"], state)
-                if price is None:
-                    price = state.get("highest", state.get("entry_price", 0))
-                bot._close(state["symbol"], price, "eod")
-
-            # Nightly backtest
-            best = bot.model.backtest_params()
-            if best:
-                bot.param_sl = best.get("sl", bot.param_sl)
-                bot.param_trail_act = best.get("trail_act", bot.param_trail_act)
-                bot.param_trail_dist = best.get("trail_dist", bot.param_trail_dist)
-                logger.info("Nightly tune: %s", best)
-            logger.info("Model: %s", bot.model.report())
 
         await asyncio.sleep(10)
 
